@@ -87,6 +87,95 @@ ggplot() +
   theme_bw()
 ```
 
+## Classify the 10 pseudosamples
+
+Fit a regularized logistic regression to the real samples. The two samples used
+to construct the pseudosamples are left out of the training data so that the
+classifier does not see the exact interpolation endpoints. Gene selection and
+cross-validation also use only the remaining real samples; the interpolation
+weights are not supplied to the classifier.
+
+Run `install.packages("glmnet")` once if the package is not already installed.
+
+```{r}
+if (!requireNamespace("glmnet", quietly = TRUE)) {
+  stop("Install glmnet first with install.packages('glmnet')")
+}
+
+# Assemble real samples and remove the two interpolation endpoints.
+real_idx <- c(hypo_idx, sc_idx)
+real_log <- log10(cts[, real_idx] + 1)
+endpoint_ids <- c("SRR1402882", "SRR1413454")
+train_keep <- !colnames(real_log) %in% endpoint_ids
+train_log <- real_log[, train_keep, drop = FALSE]
+
+# 1 = Spinal cord, 0 = Hypothalamus.
+y <- as.integer(grepl("Spinal cord", condition[real_idx][train_keep]))
+
+# Select features using training samples only.
+train_rv <- rowVars(train_log)
+feature_idx <- order(train_rv, decreasing = TRUE)[seq_len(min(500, nrow(train_log)))]
+x_train <- t(train_log[feature_idx, , drop = FALSE])
+x_pseudo <- t(pseudo[feature_idx, , drop = FALSE])
+
+# Use balanced observation weights because the class sizes differ.
+obs_weights <- ifelse(
+  y == 1,
+  length(y) / (2 * sum(y == 1)),
+  length(y) / (2 * sum(y == 0))
+)
+
+# Make the same stratified folds for every alpha value.
+set.seed(784)
+nfolds <- 10
+foldid <- integer(length(y))
+for (class_value in 0:1) {
+  idx <- which(y == class_value)
+  foldid[idx] <- sample(rep(seq_len(nfolds), length.out = length(idx)))
+}
+
+# Cross-validation chooses both alpha and lambda.
+alpha_grid <- c(0, 0.1, 0.25, 0.5, 0.75, 1)
+cv_fits <- lapply(alpha_grid, function(alpha_value) {
+  glmnet::cv.glmnet(
+    x = x_train,
+    y = y,
+    family = "binomial",
+    alpha = alpha_value,
+    weights = obs_weights,
+    foldid = foldid,
+    type.measure = "deviance"
+  )
+})
+
+best_fit_idx <- which.min(vapply(cv_fits, function(fit) min(fit$cvm), numeric(1)))
+best_fit <- cv_fits[[best_fit_idx]]
+best_alpha <- alpha_grid[best_fit_idx]
+
+# lambda.1se favors the simpler model within one standard error of the minimum.
+p_spinal <- drop(predict(
+  best_fit,
+  newx = x_pseudo,
+  s = "lambda.1se",
+  type = "response"
+))
+
+classification <- data.frame(
+  sample = colnames(pseudo),
+  p_spinal_cord = p_spinal,
+  predicted_label = ifelse(p_spinal >= 0.5, "Spinal cord", "Hypothalamus")
+)
+
+best_alpha
+classification
+```
+
+The probability is a model-based continuous score: values near 0 favor
+Hypothalamus, values near 1 favor Spinal cord, and values near 0.5 are
+borderline. Because the pseudosamples are artificial mixtures, the probability
+is more informative than pretending every sample has an unambiguous biological
+identity.
+
 ```{r}
 sessionInfo()
 ```
