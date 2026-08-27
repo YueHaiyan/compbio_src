@@ -13,6 +13,7 @@ library(magrittr)
 library(matrixStats)
 library(ggplot2)
 library(GGally)
+library(glmnet)
 source(here("bioc","my_scale_counts.R"))
 ```
 
@@ -85,6 +86,205 @@ ggpairs(dat,
   theme_bw()
 ```
 
+## Multinomial classification with cross-validation
+
+We use a multinomial elastic-net classifier on the 500 log-count features.
+The mixing parameter is fixed at `alpha = 0.5`, while 10-fold stratified
+cross-validation tunes `lambda`. Class weights give each brain region equal
+influence even though the regions have different sample sizes. Setting
+`keep = TRUE` retains the prediction for every sample from the fold in which
+that sample was left out.
+
+```{r}
+# glmnet expects samples in rows and genes in columns.
+x_model <- t(x)
+colnames(x_model) <- rownames(x)
+
+# Reproducible stratified folds.
+set.seed(784)
+nfolds <- 10
+foldid <- integer(length(y))
+for (region in levels(y)) {
+  region_idx <- which(y == region)
+  foldid[region_idx] <- sample(
+    rep(seq_len(nfolds), length.out = length(region_idx))
+  )
+}
+
+# Balance the contribution of the three regions to the CV loss.
+class_weight <- length(y) / (nlevels(y) * table(y))
+observation_weight <- unname(class_weight[as.character(y)])
+
+cv_fit <- cv.glmnet(
+  x = x_model,
+  y = y,
+  family = "multinomial",
+  alpha = 0.5,
+  weights = observation_weight,
+  foldid = foldid,
+  type.measure = "deviance",
+  standardize = TRUE,
+  keep = TRUE
+)
+
+c(lambda_min = cv_fit$lambda.min,
+  lambda_1se = cv_fit$lambda.1se)
+```
+
+### Cross-validation error curve
+
+The curve shows the weighted out-of-fold misclassification rate. The shaded
+interval is plus or minus one standard error across folds. We select `lambda`
+with the one-standard-error rule applied to multinomial deviance because
+deviance evaluates the full class probabilities, not only the winning label.
+
+```{r fig.width=7.5, fig.height=5}
+# Convert each lambda's held-out scores to hard labels, then summarize the
+# weighted error separately within each fold.
+fold_error <- matrix(NA_real_, nrow = nfolds, ncol = length(cv_fit$lambda))
+for (j in seq_along(cv_fit$lambda)) {
+  score_j <- cv_fit$fit.preval[, , j]
+  pred_j <- factor(
+    colnames(score_j)[max.col(score_j, ties.method = "first")],
+    levels = levels(y)
+  )
+  for (fold in seq_len(nfolds)) {
+    held_out <- foldid == fold
+    fold_error[fold, j] <- weighted.mean(
+      pred_j[held_out] != y[held_out],
+      w = observation_weight[held_out]
+    )
+  }
+}
+
+cv_error <- colMeans(fold_error)
+cv_error_se <- apply(fold_error, 2, sd) / sqrt(nfolds)
+
+cv_curve <- data.frame(
+  lambda = cv_fit$lambda,
+  log_lambda = log(cv_fit$lambda),
+  error = cv_error,
+  lower = pmax(0, cv_error - cv_error_se),
+  upper = pmin(1, cv_error + cv_error_se)
+)
+cv_curve <- cv_curve[order(cv_curve$log_lambda), ]
+
+ggplot(cv_curve, aes(log_lambda, error)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper),
+              fill = "#D8E8F2", alpha = 0.85) +
+  geom_line(color = "#2C6E9F", linewidth = 1) +
+  geom_point(color = "#2C6E9F", size = 1.4) +
+  geom_vline(xintercept = log(cv_fit$lambda.min),
+             color = "grey35", linetype = "dotted") +
+  geom_vline(xintercept = log(cv_fit$lambda.1se),
+             color = "#C44E2B", linetype = "dashed") +
+  coord_cartesian(ylim = c(0, max(cv_curve$upper))) +
+  labs(
+    title = "10-fold cross-validation classification error across lambda",
+    subtitle = paste0(
+      "Multinomial elastic net (alpha = 0.5); n = ", length(y),
+      ". Lambda selected by deviance: dotted minimum, dashed one-SE"
+    ),
+    x = "log(lambda)",
+    y = "Weighted misclassification rate"
+  ) +
+  theme_bw(base_size = 11)
+```
+
+### Out-of-fold predictions and posterior probabilities
+
+For the selected `lambda`, each row below uses the prediction generated while
+that sample was left out of model fitting. The three probabilities therefore
+sum to one and can be used both for a hard label and as a measure of
+classification uncertainty.
+
+```{r}
+lambda_idx <- which.min(abs(cv_fit$lambda - cv_fit$lambda.1se))
+oof_link <- cv_fit$fit.preval[, , lambda_idx, drop = FALSE]
+oof_link <- oof_link[, , 1]
+
+# fit.preval stores multinomial linear predictors. Convert them to class
+# probabilities with a numerically stable row-wise softmax.
+row_max <- apply(oof_link, 1, max)
+oof_exp <- exp(sweep(oof_link, 1, row_max, "-"))
+oof_probability <- oof_exp / rowSums(oof_exp)
+stopifnot(
+  all(is.finite(oof_probability)),
+  all(oof_probability >= 0),
+  all(oof_probability <= 1),
+  max(abs(rowSums(oof_probability) - 1)) < 1e-10
+)
+
+predicted_region <- factor(
+  colnames(oof_probability)[max.col(oof_probability, ties.method = "first")],
+  levels = levels(y)
+)
+
+confusion <- table(True = y, Predicted = predicted_region)
+overall_accuracy <- mean(predicted_region == y)
+class_recall <- diag(confusion) / rowSums(confusion)
+balanced_accuracy <- mean(class_recall)
+
+posterior <- data.frame(
+  sample = rownames(x_model),
+  true_region = y,
+  predicted_region = predicted_region,
+  oof_probability,
+  check.names = FALSE
+)
+names(posterior)[4:6] <- paste0("P(", colnames(oof_probability), ")")
+posterior$confidence <- apply(oof_probability, 1, max)
+posterior$correct <- posterior$true_region == posterior$predicted_region
+
+metrics <- data.frame(
+  metric = c("Overall accuracy", "Balanced accuracy"),
+  estimate = c(overall_accuracy, balanced_accuracy)
+)
+metrics
+
+per_region <- data.frame(
+  region = names(class_recall),
+  recall = unname(class_recall),
+  n = unname(rowSums(confusion))
+)
+per_region
+```
+
+The complete sample-level result is stored in `posterior`. The least-confident
+samples are printed here because they are the most useful cases to inspect.
+
+```{r}
+posterior[order(posterior$confidence), ] |> head(15)
+```
+
+### Confusion matrix
+
+```{r fig.width=7, fig.height=5.8}
+confusion_dat <- as.data.frame(confusion)
+
+ggplot(confusion_dat, aes(Predicted, True, fill = Freq)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(aes(label = Freq), color = "#17212B", size = 5) +
+  scale_fill_gradient(low = "#F5F7F9", high = "#4E88AE",
+                      name = "Samples") +
+  coord_equal() +
+  labs(
+    title = "Out-of-fold confusion matrix",
+    subtitle = sprintf(
+      "10-fold CV at one-SE lambda; accuracy = %.1f%%, balanced accuracy = %.1f%%",
+      100 * overall_accuracy, 100 * balanced_accuracy
+    ),
+    x = "Predicted region",
+    y = "True region"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 25, hjust = 1),
+    legend.position = "right"
+  )
+```
+
 Some more information about the genes:
 
 ```{r}
@@ -100,6 +300,47 @@ head(gene_dat)
 if (!identical(rownames(gene_dat), rownames(x)))
   gene_dat <- gene_dat[rownames(x),,drop=FALSE]
 ```
+
+The absolute multinomial coefficient is a model-based measure of how strongly
+a gene contributes to distinguishing a region at the selected `lambda`. It is
+not a causal effect or a differential-expression test.
+
+```{r}
+coefficient_list <- coef(cv_fit$glmnet.fit, s = cv_fit$lambda.1se)
+
+top_gene_coefficients <- do.call(rbind, lapply(names(coefficient_list), function(region) {
+  beta <- as.numeric(coefficient_list[[region]][, 1])
+  names(beta) <- rownames(coefficient_list[[region]])
+  beta <- beta[names(beta) != "(Intercept)"]
+  nonzero <- which(beta != 0)
+  selected <- head(nonzero[order(abs(beta[nonzero]), decreasing = TRUE)], 10)
+  gene_id <- names(beta)[selected]
+  symbol <- gene_dat[gene_id, "symbol"]
+  symbol[is.na(symbol) | symbol == ""] <- gene_id[is.na(symbol) | symbol == ""]
+
+  data.frame(
+    region = region,
+    gene_id = gene_id,
+    symbol = symbol,
+    coefficient = unname(beta[selected]),
+    absolute_coefficient = abs(unname(beta[selected]))
+  )
+}))
+rownames(top_gene_coefficients) <- NULL
+top_gene_coefficients
+```
+
+## Interpretation and validation notes
+
+- The confusion matrix and posterior probabilities use out-of-fold predictions;
+  no sample is predicted by a model that was fitted on that sample.
+- The one-standard-error rule reduces model complexity relative to selecting
+  the numerically smallest CV error.
+- The 500-gene variance filter follows the supplied setup and is unsupervised,
+  but it is computed before CV. A strictly external performance estimate would
+  repeat feature selection inside an outer, nested cross-validation loop.
+- Posterior probabilities from penalized multinomial regression are model-based
+  class probabilities; they are not guaranteed to be perfectly calibrated.
 
 ```{r}
 sessionInfo()
